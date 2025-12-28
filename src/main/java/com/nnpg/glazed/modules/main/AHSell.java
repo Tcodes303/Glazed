@@ -2,8 +2,8 @@ package com.nnpg.glazed.modules.main;
 
 import com.nnpg.glazed.GlazedAddon;
 import com.nnpg.glazed.VersionUtil;
-import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.events.game.ReceiveMessageEvent;
+import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.orbit.EventHandler;
@@ -19,65 +19,64 @@ public class AHSell extends Module {
 
     private final Setting<String> sellPrice = sgGeneral.add(new StringSetting.Builder()
         .name("sell-price")
-        .description("The price to list each hotbar item for. Supports K/M/B.")
         .defaultValue("30k")
         .build()
     );
 
     private final Setting<Integer> confirmDelay = sgGeneral.add(new IntSetting.Builder()
         .name("confirm-delay")
-        .description("Delay in ticks before clicking the confirm button.")
         .defaultValue(10)
         .min(0)
-        .max(100)
-        .sliderMax(20)
+        .max(40)
         .build()
     );
 
     private final Setting<Boolean> notifications = sgGeneral.add(new BoolSetting.Builder()
         .name("notifications")
-        .description("Show chat notifications.")
         .defaultValue(true)
         .build()
     );
 
     private final Setting<Boolean> enableFilter = sgGeneral.add(new BoolSetting.Builder()
         .name("enable-item-filter")
-        .description("Only sell selected item type from the hotbar.")
         .defaultValue(false)
         .build()
     );
 
     private final Setting<Item> filterItem = sgGeneral.add(new ItemSetting.Builder()
         .name("filter-item")
-        .description("Only this item will be sold when filter is enabled.")
         .defaultValue(Items.DIAMOND)
         .build()
     );
 
-    private int delayCounter = 0;
-    private boolean awaitingConfirmation = false;
-    private int currentSlot = 0;
+    private final Setting<Integer> requiredAmount = sgGeneral.add(new IntSetting.Builder()
+        .name("required-amount")
+        .description("Only sell if slot contains exactly this amount.")
+        .defaultValue(2)
+        .min(1)
+        .max(64)
+        .build()
+    );
+
+    private final Setting<Boolean> autoSplit = sgGeneral.add(new BoolSetting.Builder()
+        .name("auto-split")
+        .description("Automatically create required-amount stacks.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private int delayCounter;
+    private boolean awaitingConfirmation;
+    private int currentSlot;
 
     public AHSell() {
-        super(GlazedAddon.CATEGORY, "ah-sell", "Automatically sells all hotbar items using /ah sell.");
+        super(GlazedAddon.CATEGORY, "ah-sell", "Sells only exact stacks and auto-splits.");
     }
 
     @Override
     public void onActivate() {
-        if (!isValidPrice(sellPrice.get())) {
-            if (notifications.get()) error("Invalid price format: " + sellPrice.get());
-            toggle();
-            return;
-        }
-
-        if (!hasSellableItemsInHotbar()) {
-            if (notifications.get()) error("No sellable items found in hotbar.");
-            toggle();
-            return;
-        }
-
         currentSlot = 0;
+        awaitingConfirmation = false;
         attemptSellCurrentSlot();
     }
 
@@ -90,72 +89,77 @@ public class AHSell extends Module {
     private void onTick(TickEvent.Pre event) {
         if (!awaitingConfirmation || mc.player == null) return;
 
-        if (delayCounter > 0) {
-            delayCounter--;
-            return;
-        }
+        if (delayCounter-- > 0) return;
 
-        ScreenHandler screenHandler = mc.player.currentScreenHandler;
-
-        if (screenHandler instanceof GenericContainerScreenHandler handler) {
-            if (handler.getRows() == 3) {
-                ItemStack confirmButton = handler.getSlot(15).getStack();
-                if (!confirmButton.isEmpty()) {
-                    mc.interactionManager.clickSlot(handler.syncId, 15, 1, SlotActionType.QUICK_MOVE, mc.player);
-                    if (notifications.get()) info("Sold item in hotbar slot " + currentSlot + ".");
-                }
-
-                awaitingConfirmation = false;
-                moveToNextSlot();
+        ScreenHandler sh = mc.player.currentScreenHandler;
+        if (sh instanceof GenericContainerScreenHandler handler && handler.getRows() == 3) {
+            ItemStack confirm = handler.getSlot(15).getStack();
+            if (!confirm.isEmpty()) {
+                mc.interactionManager.clickSlot(
+                    handler.syncId, 15, 0, SlotActionType.PICKUP, mc.player
+                );
             }
+            awaitingConfirmation = false;
+            moveToNextSlot();
         }
     }
 
     @EventHandler
     private void onChatMessage(ReceiveMessageEvent event) {
-        String msg = event.getMessage().getString();
-        if (msg.contains("You have too many listed items.")) {
-            if (notifications.get()) warning("Sell limit reached! Disabling module.");
+        if (event.getMessage().getString().contains("too many listed")) {
+            warning("AH limit reached.");
             toggle();
         }
     }
 
     private void attemptSellCurrentSlot() {
         if (currentSlot > 8) {
-            if (notifications.get()) info("Finished processing hotbar. Disabling module.");
+            info("Finished hotbar.");
             toggle();
             return;
         }
 
-        // Use VersionUtil to handle version differences
         VersionUtil.setSelectedSlot(mc.player, currentSlot);
         ItemStack stack = mc.player.getInventory().getStack(currentSlot);
-
-        if (enableFilter.get() && (stack.isEmpty() || !stack.isOf(filterItem.get()))) {
-            if (notifications.get()) info("Skipping slot " + currentSlot + " (does not match filter).");
-            moveToNextSlot();
-            return;
-        }
 
         if (stack.isEmpty()) {
             moveToNextSlot();
             return;
         }
 
-        String price = sellPrice.get().trim();
-        double parsedPrice = parsePrice(price);
-
-        if (parsedPrice <= 0) {
-            if (notifications.get()) error("Invalid price format: " + price);
-            toggle();
+        if (enableFilter.get() && !stack.isOf(filterItem.get())) {
+            moveToNextSlot();
             return;
         }
 
-        if (notifications.get()) {
-            info("Sending /ah sell %s for slot %d", formatPrice(parsedPrice), currentSlot);
+        // AUTO SPLIT
+        if (autoSplit.get() && stack.getCount() > requiredAmount.get()) {
+            int empty = findEmptyHotbarSlot();
+            if (empty == -1) {
+                error("No empty hotbar slot for splitting.");
+                toggle();
+                return;
+            }
+
+            splitStack(currentSlot, empty, requiredAmount.get());
+            currentSlot = empty;
+            stack = mc.player.getInventory().getStack(currentSlot);
         }
 
-        mc.getNetworkHandler().sendChatCommand("ah sell " + price);
+        // ONLY SELL EXACT AMOUNT
+        if (stack.getCount() != requiredAmount.get()) {
+            moveToNextSlot();
+            return;
+        }
+
+        mc.getNetworkHandler().sendChatCommand(
+            "ah sell " + requiredAmount.get() + " " + sellPrice.get()
+        );
+
+        if (notifications.get()) {
+            info("Selling %dx item(s) from slot %d", requiredAmount.get(), currentSlot);
+        }
+
         delayCounter = confirmDelay.get();
         awaitingConfirmation = true;
     }
@@ -165,57 +169,23 @@ public class AHSell extends Module {
         attemptSellCurrentSlot();
     }
 
-    private boolean hasSellableItemsInHotbar() {
-        for (int slot = 0; slot <= 8; slot++) {
-            ItemStack stack = mc.player.getInventory().getStack(slot);
-            if (stack.isEmpty()) continue;
-
-            if (enableFilter.get()) {
-                if (stack.isOf(filterItem.get())) return true;
-            } else {
-                return true;
-            }
+    private int findEmptyHotbarSlot() {
+        for (int i = 0; i <= 8; i++) {
+            if (mc.player.getInventory().getStack(i).isEmpty()) return i;
         }
-        return false;
+        return -1;
     }
 
-    private boolean isValidPrice(String priceStr) {
-        return parsePrice(priceStr) > 0;
-    }
+    private void splitStack(int from, int to, int amount) {
+        
+        mc.interactionManager.clickSlot(0, from + 36, 0, SlotActionType.PICKUP, mc.player);
 
-    private double parsePrice(String priceStr) {
-        if (priceStr == null || priceStr.isEmpty()) return -1.0;
-
-        String cleaned = priceStr.trim().toUpperCase();
-        double multiplier = 1.0;
-
-        if (cleaned.endsWith("B")) {
-            multiplier = 1_000_000_000.0;
-            cleaned = cleaned.substring(0, cleaned.length() - 1);
-        } else if (cleaned.endsWith("M")) {
-            multiplier = 1_000_000.0;
-            cleaned = cleaned.substring(0, cleaned.length() - 1);
-        } else if (cleaned.endsWith("K")) {
-            multiplier = 1_000.0;
-            cleaned = cleaned.substring(0, cleaned.length() - 1);
+       
+        for (int i = 0; i < amount; i++) {
+            mc.interactionManager.clickSlot(0, from + 36, 1, SlotActionType.PICKUP, mc.player);
         }
 
-        try {
-            return Double.parseDouble(cleaned) * multiplier;
-        } catch (NumberFormatException e) {
-            return -1.0;
-        }
-    }
-
-    private String formatPrice(double price) {
-        if (price >= 1_000_000_000) {
-            return String.format("%.2fB", price / 1_000_000_000);
-        } else if (price >= 1_000_000) {
-            return String.format("%.2fM", price / 1_000_000);
-        } else if (price >= 1_000) {
-            return String.format("%.2fK", price / 1_000);
-        } else {
-            return String.format("%.2f", price);
-        }
+       
+        mc.interactionManager.clickSlot(0, to + 36, 0, SlotActionType.PICKUP, mc.player);
     }
 }
